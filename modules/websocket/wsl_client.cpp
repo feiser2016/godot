@@ -5,8 +5,8 @@
 /*                           GODOT ENGINE                                */
 /*                      https://godotengine.org                          */
 /*************************************************************************/
-/* Copyright (c) 2007-2019 Juan Linietsky, Ariel Manzur.                 */
-/* Copyright (c) 2014-2019 Godot Engine contributors (cf. AUTHORS.md)    */
+/* Copyright (c) 2007-2020 Juan Linietsky, Ariel Manzur.                 */
+/* Copyright (c) 2014-2020 Godot Engine contributors (cf. AUTHORS.md).   */
 /*                                                                       */
 /* Permission is hereby granted, free of charge, to any person obtaining */
 /* a copy of this software and associated documentation files (the       */
@@ -86,9 +86,11 @@ void WSLClient::_do_handshake() {
 				WSLPeer::PeerData *data = memnew(struct WSLPeer::PeerData);
 				data->obj = this;
 				data->conn = _connection;
+				data->tcp = _tcp;
 				data->is_server = false;
 				data->id = 1;
 				_peer->make_context(data, _in_buf_size, _in_pkt_size, _out_buf_size, _out_pkt_size);
+				_peer->set_no_delay(true);
 				_on_connect(protocol);
 				break;
 			}
@@ -115,10 +117,11 @@ bool WSLClient::_verify_headers(String &r_protocol) {
 		ERR_FAIL_COND_V_MSG(header.size() != 2, false, "Invalid header -> " + psa[i] + ".");
 		String name = header[0].to_lower();
 		String value = header[1].strip_edges();
-		if (headers.has(name))
+		if (headers.has(name)) {
 			headers[name] += "," + value;
-		else
+		} else {
 			headers[name] = value;
+		}
 	}
 
 #define _WSL_CHECK(NAME, VALUE)                                                         \
@@ -140,19 +143,20 @@ bool WSLClient::_verify_headers(String &r_protocol) {
 		r_protocol = headers["sec-websocket-protocol"];
 		bool valid = false;
 		for (int i = 0; i < _protocols.size(); i++) {
-			if (_protocols[i] != r_protocol)
+			if (_protocols[i] != r_protocol) {
 				continue;
+			}
 			valid = true;
 			break;
 		}
-		if (!valid)
+		if (!valid) {
 			return false;
+		}
 	}
 	return true;
 }
 
-Error WSLClient::connect_to_host(String p_host, String p_path, uint16_t p_port, bool p_ssl, PoolVector<String> p_protocols) {
-
+Error WSLClient::connect_to_host(String p_host, String p_path, uint16_t p_port, bool p_ssl, const Vector<String> p_protocols, const Vector<String> p_custom_headers) {
 	ERR_FAIL_COND_V(_connection.is_valid(), ERR_ALREADY_IN_USE);
 
 	_peer = Ref<WSLPeer>(memnew(WSLPeer));
@@ -180,7 +184,12 @@ Error WSLClient::connect_to_host(String p_host, String p_path, uint16_t p_port, 
 	_connection = _tcp;
 	_use_ssl = p_ssl;
 	_host = p_host;
-	_protocols = p_protocols;
+	// Strip edges from protocols.
+	_protocols.resize(p_protocols.size());
+	String *pw = _protocols.ptrw();
+	for (int i = 0; i < p_protocols.size(); i++) {
+		pw[i] = p_protocols[i].strip_edges();
+	}
 
 	_key = WSLPeer::generate_key();
 	// TODO custom extra headers (allow overriding this too?)
@@ -193,11 +202,15 @@ Error WSLClient::connect_to_host(String p_host, String p_path, uint16_t p_port, 
 	if (p_protocols.size() > 0) {
 		request += "Sec-WebSocket-Protocol: ";
 		for (int i = 0; i < p_protocols.size(); i++) {
-			if (i != 0)
+			if (i != 0) {
 				request += ",";
+			}
 			request += p_protocols[i];
 		}
 		request += "\r\n";
+	}
+	for (int i = 0; i < p_custom_headers.size(); i++) {
+		request += p_custom_headers[i] + "\r\n";
 	}
 	request += "\r\n";
 	_request = request.utf8();
@@ -219,8 +232,9 @@ void WSLClient::poll() {
 		return;
 	}
 
-	if (_connection.is_null())
+	if (_connection.is_null()) {
 		return; // Not connected.
+	}
 
 	switch (_tcp->get_status()) {
 		case StreamPeerTCP::STATUS_NONE:
@@ -236,20 +250,20 @@ void WSLClient::poll() {
 					ssl = Ref<StreamPeerSSL>(StreamPeerSSL::create());
 					ERR_FAIL_COND_MSG(ssl.is_null(), "SSL is not available in this build.");
 					ssl->set_blocking_handshake_enabled(false);
-					if (ssl->connect_to_stream(_tcp, verify_ssl, _host) != OK) {
+					if (ssl->connect_to_stream(_tcp, verify_ssl, _host, ssl_cert) != OK) {
 						disconnect_from_host();
 						_on_error();
 						return;
 					}
 					_connection = ssl;
 				} else {
-					ssl = static_cast<Ref<StreamPeerSSL> >(_connection);
+					ssl = static_cast<Ref<StreamPeerSSL>>(_connection);
 					ERR_FAIL_COND(ssl.is_null()); // Bug?
 					ssl->poll();
 				}
-				if (ssl->get_status() == StreamPeerSSL::STATUS_HANDSHAKING)
+				if (ssl->get_status() == StreamPeerSSL::STATUS_HANDSHAKING) {
 					return; // Need more polling.
-				else if (ssl->get_status() != StreamPeerSSL::STATUS_CONNECTED) {
+				} else if (ssl->get_status() != StreamPeerSSL::STATUS_CONNECTED) {
 					disconnect_from_host();
 					_on_error();
 					return; // Error.
@@ -268,32 +282,31 @@ void WSLClient::poll() {
 }
 
 Ref<WebSocketPeer> WSLClient::get_peer(int p_peer_id) const {
-
-	ERR_FAIL_COND_V(p_peer_id != 1, NULL);
+	ERR_FAIL_COND_V(p_peer_id != 1, nullptr);
 
 	return _peer;
 }
 
 NetworkedMultiplayerPeer::ConnectionStatus WSLClient::get_connection_status() const {
-
-	if (_peer->is_connected_to_host())
+	if (_peer->is_connected_to_host()) {
 		return CONNECTION_CONNECTED;
+	}
 
-	if (_tcp->is_connected_to_host())
+	if (_tcp->is_connected_to_host()) {
 		return CONNECTION_CONNECTING;
+	}
 
 	return CONNECTION_DISCONNECTED;
 }
 
 void WSLClient::disconnect_from_host(int p_code, String p_reason) {
-
 	_peer->close(p_code, p_reason);
-	_connection = Ref<StreamPeer>(NULL);
+	_connection = Ref<StreamPeer>(nullptr);
 	_tcp = Ref<StreamPeerTCP>(memnew(StreamPeerTCP));
 
 	_key = "";
 	_host = "";
-	_protocols.resize(0);
+	_protocols.clear();
 	_use_ssl = false;
 
 	_request = "";
@@ -304,13 +317,13 @@ void WSLClient::disconnect_from_host(int p_code, String p_reason) {
 }
 
 IP_Address WSLClient::get_connected_host() const {
-
-	return IP_Address();
+	ERR_FAIL_COND_V(!_peer->is_connected_to_host(), IP_Address());
+	return _peer->get_connected_host();
 }
 
 uint16_t WSLClient::get_connected_port() const {
-
-	return 1025;
+	ERR_FAIL_COND_V(!_peer->is_connected_to_host(), 0);
+	return _peer->get_connected_port();
 }
 
 Error WSLClient::set_buffers(int p_in_buffer, int p_in_packets, int p_out_buffer, int p_out_packets) {
@@ -324,10 +337,10 @@ Error WSLClient::set_buffers(int p_in_buffer, int p_in_packets, int p_out_buffer
 }
 
 WSLClient::WSLClient() {
-	_in_buf_size = nearest_shift((int)GLOBAL_GET(WSC_IN_BUF) - 1) + 10;
-	_in_pkt_size = nearest_shift((int)GLOBAL_GET(WSC_IN_PKT) - 1);
-	_out_buf_size = nearest_shift((int)GLOBAL_GET(WSC_OUT_BUF) - 1) + 10;
-	_out_pkt_size = nearest_shift((int)GLOBAL_GET(WSC_OUT_PKT) - 1);
+	_in_buf_size = DEF_BUF_SHIFT;
+	_in_pkt_size = DEF_PKT_SHIFT;
+	_out_buf_size = DEF_BUF_SHIFT;
+	_out_pkt_size = DEF_PKT_SHIFT;
 
 	_peer.instance();
 	_tcp.instance();
@@ -335,7 +348,6 @@ WSLClient::WSLClient() {
 }
 
 WSLClient::~WSLClient() {
-
 	_peer->close_now();
 	_peer->invalidate();
 	disconnect_from_host();
